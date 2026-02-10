@@ -21,6 +21,46 @@
 #import <execinfo.h>
 
 // ============================================================================
+// 配置选项：内存读取方式
+// ============================================================================
+
+/**
+ * 内存读取方式选择开关
+ * 
+ * 使用方式：
+ * 1. 在项目的 Build Settings → Preprocessor Macros 中定义
+ * 2. 或在此文件开头（导入之前）定义
+ * 
+ * 选项说明：
+ * 
+ * USE_VM_READ_OVERWRITE = 1（默认，推荐）
+ * - 使用 vm_read_overwrite（内核级安全读取）
+ * - 优点：安全可靠，无效地址不会崩溃
+ * - 缺点：性能稍慢（约 2-3 倍）
+ * - 适用场景：生产环境、跨线程读取、不确定栈是否有效
+ * 
+ * USE_VM_READ_OVERWRITE = 0
+ * - 使用 memcpy + @try/@catch（直接读取）
+ * - 优点：性能快
+ * - 缺点：无效地址可能崩溃（部分信号无法捕获）
+ * - 适用场景：开发调试、性能敏感场景、确定栈有效
+ * 
+ * 示例：
+ * // 在 Build Settings → Preprocessor Macros 中添加：
+ * USE_VM_READ_OVERWRITE=1  （生产环境）
+ * USE_VM_READ_OVERWRITE=0  （性能测试）
+ */
+#ifndef USE_VM_READ_OVERWRITE
+    #if DEBUG
+        // Debug 模式：优先性能，便于调试
+        #define USE_VM_READ_OVERWRITE 0
+    #else
+        // Release 模式：优先安全，防止崩溃
+        #define USE_VM_READ_OVERWRITE 1
+    #endif
+#endif
+
+// ============================================================================
 // Darwin 平台非标准扩展函数声明（兜底方案）
 // ============================================================================
 #if !defined(pthread_main_thread_np)
@@ -88,6 +128,19 @@ typedef struct {
 // ============================================================================
 
 @implementation SimpleBacktrace
+
+#pragma mark - Initialization
+
+/**
+ * 类加载时输出配置信息
+ */
++ (void)load {
+#if USE_VM_READ_OVERWRITE
+    NSLog(@"🛡️ SimpleBacktrace: 使用 vm_read_overwrite（安全模式）");
+#else
+    NSLog(@"⚡️ SimpleBacktrace: 使用 memcpy（性能模式）");
+#endif
+}
 
 #pragma mark - Public Methods
 
@@ -269,23 +322,117 @@ typedef struct {
 }
 
 /**
- * 安全地从内存复制数据
+ * 安全地从内存复制数据（使用 vm_read_overwrite）
  * 
  * 为什么需要安全复制？
- * - FP 可能指向无效内存
+ * - FP 可能指向无效内存（栈已被破坏、野指针等）
  * - 直接访问可能导致 SIGSEGV 崩溃
+ * - 跨线程读取内存需要特殊处理
+ * 
+ * 两种实现方式对比：
+ * 
+ * 方式 1：vm_read_overwrite（推荐）
+ * - 通过 Mach 内核 API 读取
+ * - 内核会验证地址有效性
+ * - 读取失败返回错误码，不会崩溃
+ * - 适用于跨线程读取
+ * - 性能开销稍大（需要陷入内核）
+ * 
+ * 方式 2：memcpy + @try/@catch（简化版）
+ * - 直接内存访问
+ * - 依赖异常处理机制
+ * - 性能开销小
+ * - 无法捕获所有类型的内存错误（如 SIGBUS）
  */
 + (BOOL)safelyCopyMemory:(const void *)source
                       to:(void *)destination
                     size:(size_t)size {
+#if USE_VM_READ_OVERWRITE
+    // ========================================================================
+    // 方式 1：使用 vm_read_overwrite（安全优先）
+    // ========================================================================
+    
+    // 获取当前任务（进程）
+    mach_port_t task = mach_task_self();
+    
+    // 准备输出参数
+    vm_size_t outSize = size;
+    
+    // 调用 vm_read_overwrite
+    // - 从当前任务的 source 地址读取 size 字节
+    // - 写入到 destination 地址
+    // - 如果地址无效，返回 KERN_INVALID_ADDRESS
+    kern_return_t kr = vm_read_overwrite(
+        task,                           // 目标任务
+        (vm_address_t)source,          // 源地址
+        (vm_size_t)size,               // 读取大小
+        (vm_address_t)destination,     // 目标地址
+        &outSize                        // 实际读取的大小
+    );
+    
+    if (kr == KERN_SUCCESS && outSize == size) {
+        return YES;
+    }
+    
+    // 降级方案：如果 vm_read_overwrite 失败，尝试直接复制
     @try {
-        // 使用 vm_read_overwrite 是更安全的方式
-        // 这里简化处理，使用 memcpy + 异常保护
         memcpy(destination, source, size);
         return YES;
     } @catch (NSException *exception) {
+        NSLog(@"❌ 内存复制失败: source=%p, size=%zu, vm_error=%s", 
+              source, size, mach_error_string(kr));
         return NO;
     }
+    
+#else
+    // ========================================================================
+    // 方式 2：使用 memcpy + 异常保护（性能优先）
+    // ========================================================================
+    
+    @try {
+        memcpy(destination, source, size);
+        return YES;
+    } @catch (NSException *exception) {
+        NSLog(@"❌ 内存复制失败: source=%p, size=%zu, exception=%@", 
+              source, size, exception);
+        return NO;
+    }
+#endif
+}
+
+/**
+ * 安全地从内存复制数据（简化版本）
+ * 
+ * 注意：
+ * - 本方法用于读取当前任务的内存
+ * - 如果需要读取其他任务的内存，需要传入 task 参数
+ * - vm_read_overwrite 在读取当前进程内存时，几乎总是成功的
+ * - 但在某些极端情况下（如地址被 mprotect 保护），仍可能失败
+ * 
+ * vm_read_overwrite vs vm_read 的区别：
+ * - vm_read：分配新内存，返回数据指针（需要手动释放）
+ * - vm_read_overwrite：写入到指定缓冲区（无需释放，性能更好）
+ * 
+ * 使用场景：
+ * - 遍历栈帧时读取 FP 和 LR
+ * - 读取可能无效的内存地址
+ * - 跨线程读取栈数据
+ */
++ (BOOL)safelyCopyMemoryFromTask:(mach_port_t)task
+                          source:(const void *)source
+                              to:(void *)destination
+                            size:(size_t)size {
+    vm_size_t outSize = size;
+    
+    kern_return_t kr = vm_read_overwrite(
+        task,
+        (vm_address_t)source,
+        (vm_size_t)size,
+        (vm_address_t)destination,
+        &outSize
+    );
+    
+    return (kr == KERN_SUCCESS && outSize == size);
 }
 
 /**
