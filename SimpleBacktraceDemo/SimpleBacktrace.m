@@ -276,6 +276,19 @@ typedef struct {
     int index = 0;
     buffer[index++] = (uintptr_t)threadState.__pc;
     
+    
+    //+ (BacktraceFrame *)symbolizeAddress:(uintptr_t)address
+    
+    
+    
+    BacktraceFrame *frame = [SimpleBacktrace symbolizeAddress:(uintptr_t)threadState.__pc];
+    
+    
+    NSString *result = [SimpleBacktrace formatBacktrace:@[frame]];
+
+    
+    NSLog(@"pc - result %@", result);
+    
     // ========================================================================
     // 后续帧：通过 FP 链表遍历
     // ========================================================================
@@ -298,6 +311,15 @@ typedef struct {
             // 到达栈底
             break;
         }
+        
+        
+        BacktraceFrame *returnAddressFrame = [SimpleBacktrace symbolizeAddress:frame.returnAddress];
+        
+        
+        NSString *result = [SimpleBacktrace formatBacktrace:@[returnAddressFrame]];
+
+        
+        NSLog(@"pc - returnAddressFrame %@", result);
         
         // 保存返回地址
         buffer[index++] = frame.returnAddress;
